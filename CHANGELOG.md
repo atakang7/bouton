@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/atakang7/bouton/compare/v1.1.0...v1.1.1) (2026-05-19)
+
+
+### Bug Fixes
+
+* **cli:** print assistant reply in non-interactive mode ([bec9b86](https://github.com/atakang7/bouton/commit/bec9b860f13513a4e6404e1fd84eac3eafeafaba))
+
 ## [1.1.0](https://github.com/atakang7/bouton/compare/v1.0.0...v1.1.0) (2026-05-19)
 
 
