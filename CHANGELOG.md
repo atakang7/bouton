@@ -1,3 +1,10 @@
+## [1.1.0](https://github.com/atakang7/bouton/compare/v1.0.0...v1.1.0) (2026-05-19)
+
+
+### Features
+
+* import full coding-agent CLI from axon ([7e79bea](https://github.com/atakang7/bouton/commit/7e79beae859fef9c293ea6f5eb9a873209765d24))
+
 ## 1.0.0 (2026-05-19)
 
 
