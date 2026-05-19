@@ -56,9 +56,11 @@ type uiState struct {
 
 var ui = &uiState{atLineStart: true}
 
-// uiSilent suppresses all UI output. Set in non-interactive mode where the
-// JSONL event log is the source of truth and TUI rendering would just
-// pollute logs.
+// uiSilent suppresses UI chrome (header, prompt arrow, info lines, tool
+// argument streaming, status messages). Set in non-interactive mode so
+// --prompt callers get a clean stdout containing only the assistant's
+// reply. uiToken and uiResponse intentionally ignore this flag so the
+// final answer always reaches stdout.
 var uiSilent bool
 
 func uiHeader(provider, model string, s *agent.Session) {
@@ -100,11 +102,10 @@ func uiStartResponse() {
 }
 
 // uiToken streams an assistant content token. Detects ``` fences and applies
-// a faint background tint inside code blocks for visual grouping.
+// a faint background tint inside code blocks for visual grouping. Runs even
+// in non-interactive mode — the assistant's reply is the whole point of
+// --prompt; suppressing it would be a bug.
 func uiToken(t string) {
-	if uiSilent {
-		return
-	}
 	ui.mu.Lock()
 	defer ui.mu.Unlock()
 	if ui.lastKind != 0 && ui.lastKind != 'c' {
@@ -210,16 +211,15 @@ func uiToolArgDelta(name, delta string) {
 }
 
 func uiResponse() {
-	if uiSilent {
-		return
-	}
 	ui.mu.Lock()
 	defer ui.mu.Unlock()
 	fmt.Print(reset)
 	if !ui.atLineStart {
 		fmt.Println()
 	}
-	fmt.Println()
+	if !uiSilent {
+		fmt.Println()
+	}
 	ui.atLineStart = true
 	ui.lastKind = 0
 }
