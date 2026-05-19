@@ -1,100 +1,199 @@
-// bouton — a coding agent built on the axon runtime.
+// Command bouton is a terminal coding agent built on the axon runtime.
 //
-// This is the minimum embed: wire a coding-agent system prompt to the
-// runtime, drive Step from stdin, print tokens as they stream.
+// All runtime logic lives in github.com/atakang7/axon/agent. This binary
+// wires the runtime to a terminal: an interactive provider picker, a
+// YAML loader for agent personalities, a colored TTY renderer, and
+// slash commands.
+//
+// If you want to embed the runtime from your own Go code (HTTP server,
+// orchestrator, alternate UI), import the agent package directly and
+// see https://github.com/atakang7/axon/tree/main/examples/minimal for
+// the minimum-viable embed. bouton is one product on top of axon.
 package main
 
 import (
-	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/atakang7/axon/agent"
 )
 
-var (
-	version = "dev"
-	commit  = "none"
-	date    = "unknown"
-)
-
-const systemPrompt = `You are bouton, a terminal coding agent.
-
-You work in a real repository on the user's machine. The runtime gives you
-built-in tools: read, write, exec, bash_output, kill_shell, search, task.
-Every tool call must articulate intent in its "reason" field.
-
-Principles:
-- Read before you write. Use search to locate before you read.
-- One change per turn. Verify with exec.
-- Atomic edits only. The runtime makes /undo byte-exact; don't fight it.
-- No commentary about what you're about to do — do it, then report results.
-- Stop when the goal is met. Do not invent follow-up work.`
-
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
-		fmt.Printf("bouton %s (commit %s, built %s)\n", version, commit, date)
+	var (
+		flagPrompt = flag.String("prompt", "", "Run a single prompt non-interactively and exit when the assistant emits a final reply. Requires LLM_PROVIDER env to be set to skip the provider picker.")
+		flagAgent  = flag.String("agent", "", "Named agent config to load from $BOUTON_AGENTS_DIR (default ~/.config/bouton/agents/<name>.yaml). Empty = built-in default coding agent.")
+	)
+	flag.Parse()
+
+	agentCfg, err := LoadAgentConfig(*flagAgent)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "agent config:", err)
+		os.Exit(1)
+	}
+
+	nonInteractive := *flagPrompt != ""
+	if nonInteractive {
+		uiSilent = true
+	}
+
+	providers, err := agent.LoadProviders()
+	if err != nil {
+		uiError(err)
+		return
+	}
+	lc := loadLastChoice()
+
+	var (
+		p       agent.Provider
+		mainKey string
+	)
+	if nonInteractive {
+		p, err = agent.ResolveProvider(providers)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "non-interactive mode requires LLM_PROVIDER:", err)
+			os.Exit(1)
+		}
+		mainKey = canonicalKey(providers, p)
+	} else {
+		p, mainKey, err = resolveProviderInteractive(providers, lc.Main)
+		if err != nil {
+			uiError(err)
+			return
+		}
+	}
+
+	var (
+		prunerProvider agent.Provider
+		prunerKey      string
+		pruner         *agent.Pruner
+	)
+	if nonInteractive {
+		if sel := agent.EnvString("LLM_PRUNER_PROVIDER"); sel != "" && sel != "off" && sel != "none" {
+			prunerProvider, prunerKey, err = resolvePrunerInteractive(providers, lc.Pruner)
+			if err != nil {
+				uiError(err)
+				return
+			}
+		}
+	} else {
+		prunerProvider, prunerKey, err = resolvePrunerInteractive(providers, lc.Pruner)
+		if err != nil {
+			uiError(err)
+			return
+		}
+	}
+	if prunerKey != "" {
+		pc, err := agent.NewClient(prunerProvider)
+		if err != nil {
+			uiError(err)
+			return
+		}
+		pruner = agent.NewPruner(pc)
+	}
+
+	if !nonInteractive {
+		saveLastChoice(lastChoice{Main: mainKey, Pruner: prunerKey})
+	}
+
+	// Resolve system prompt: YAML wins, otherwise the CLI's default.
+	systemPrompt := defaultCLIPrompt
+	if agentCfg != nil {
+		if body, err := agentCfg.LoadSystemPrompt(); err == nil && strings.TrimSpace(body) != "" {
+			systemPrompt = body
+		} else if err != nil {
+			fmt.Fprintln(os.Stderr, "warning: agent system_prompt:", err)
+		}
+	}
+	customTools, err := agentCfg.BuildTools()
+	if err != nil {
+		uiError(err)
 		return
 	}
 
-	provider := providerFromEnv()
-	if provider.Model == "" {
-		fmt.Fprintln(os.Stderr, "bouton: set LLM_MODEL, LLM_BASE_URL, and LLM_API_KEY")
-		os.Exit(2)
-	}
+	tty := newTTYHandler()
 
 	ag, err := agent.New(agent.Config{
-		Provider:     provider,
+		Provider:     p,
 		SystemPrompt: systemPrompt,
-		OnEvent:      printEvent,
+		Tools:        customTools,
+		Pruner:       pruner,
+		OnEvent:      tty.Handle,
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "bouton:", err)
-		os.Exit(1)
+		uiError(err)
+		return
 	}
 	defer ag.Close()
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	if !nonInteractive {
+		uiHeader(p.Name, p.Model, ag.Session())
+		if pruner != nil {
+			uiInfo(fmt.Sprintf("pruner: %s/%s", prunerProvider.Name, prunerProvider.Model))
+		} else {
+			uiInfo("pruner: disabled")
+		}
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Println("bouton ready. Ctrl-D to exit, Ctrl-C to interrupt a turn.")
+	var inputFn func() (string, bool)
+	if nonInteractive {
+		inputFn = singleShotInput(*flagPrompt)
+	} else {
+		inputFn = pasteAwareInput(os.Stdin)
+	}
+
+	if !nonInteractive {
+		sigint := make(chan os.Signal, 1)
+		signal.Notify(sigint, os.Interrupt)
+		go func() {
+			for range sigint {
+				if ag.Interrupt() {
+					continue
+				}
+				_ = ag.Close()
+				os.Exit(130)
+			}
+		}()
+	}
+
+	// REPL: read input, handle slash commands, otherwise drive a Step.
 	for {
-		fmt.Print("\n> ")
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return
+		uiPrompt()
+		line, ok := inputFn()
+		if !ok {
+			break
 		}
-		if line == "\n" {
+		uiAfterInput()
+		trimmed := strings.TrimSpace(line)
+		if handleSlash(ag, trimmed) {
 			continue
 		}
 		if _, err := ag.Step(ctx, line); err != nil {
-			fmt.Fprintln(os.Stderr, "\nbouton:", err)
+			uiError(err)
 		}
 	}
 }
 
-func providerFromEnv() agent.Provider {
-	return agent.Provider{
-		Name:    os.Getenv("LLM_PROVIDER"),
-		Model:   os.Getenv("LLM_MODEL"),
-		BaseURL: os.Getenv("LLM_BASE_URL"),
-		APIKey:  os.Getenv("LLM_API_KEY"),
-	}
-}
+// defaultCLIPrompt is the role text the reference CLI uses when no
+// --agent personality is supplied. The runtime itself has no default
+// prompt; if you're building a different product on top of the agent
+// package you should provide your own.
+const defaultCLIPrompt = `You are bouton, a terminal coding agent.
 
-func printEvent(_ context.Context, e agent.Event) {
-	switch e.Kind {
-	case agent.KindToken:
-		fmt.Print(e.Text)
-	case agent.KindToolCall:
-		fmt.Printf("\n[tool %s]\n", e.Tool.Name)
-	case agent.KindToolError:
-		fmt.Printf("\n[tool error: %v]\n", e.Err)
-	case agent.KindAssistantEnd:
-		fmt.Println()
-	}
-}
+You work in a real repository on the user's machine. The runtime gives
+you built-in tools: read, write, exec, search, task, bash_output,
+kill_shell. Every tool call must articulate intent in its "reason" field.
+
+Principles:
+- Read before you write. Search before you read.
+- One change per turn. Verify with exec.
+- Atomic edits only. /undo is byte-exact; don't fight it.
+- Act, don't narrate.
+- Stop when the goal is met. Don't invent follow-up work.`

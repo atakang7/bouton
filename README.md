@@ -2,7 +2,7 @@
 
 **A terminal coding agent built on the [axon](https://github.com/atakang7/axon) runtime.**
 
-The runtime ships the loop (streaming, tool dispatch, append-only session, pruning). bouton ships the coding-agent personality: system prompt, defaults, and a thin CLI wrapper around `agent.Step`.
+axon ships the loop (streaming chat, tool dispatch, append-only session, secondary-LLM pruning). bouton is the product on top: a coding-agent system prompt, an interactive provider picker, a colored TTY renderer, YAML agent personalities, and slash commands.
 
 ```
 github.com/atakang7/axon/agent  ← runtime (signals)
@@ -13,7 +13,7 @@ github.com/atakang7/bouton      ← coding agent (terminal of the axon)
 
 Pre-built binaries for linux/darwin × amd64/arm64 are attached to each [GitHub Release](https://github.com/atakang7/bouton/releases).
 
-Or build from source:
+From source:
 
 ```sh
 go install github.com/atakang7/bouton/cmd/bouton@latest
@@ -21,51 +21,77 @@ go install github.com/atakang7/bouton/cmd/bouton@latest
 
 ## Run
 
-Point it at any OpenAI-compatible endpoint:
+```sh
+bouton                                  # interactive
+bouton --prompt "summarize TODOs"       # single-shot, exits when the assistant stops
+bouton --agent reviewer                 # load ~/.config/bouton/agents/reviewer.yaml
+```
+
+### Provider config
+
+bouton reads `${XDG_CONFIG_HOME:-~/.config}/agent/providers.json` (override with `AXON_PROVIDERS_PATH`):
+
+```json
+{
+  "providers": [
+    { "name": "ollama", "base_url": "http://localhost:11434", "model": "llama3" },
+    { "name": "openai", "base_url": "https://api.openai.com",  "model": "gpt-4o",          "api_key": "sk-..." },
+    { "name": "claude", "base_url": "https://api.anthropic.com","model": "claude-3-opus",  "api_key": "sk-ant-..." }
+  ]
+}
+```
+
+Or pure env:
 
 ```sh
-LLM_MODEL=gpt-4o \
-LLM_BASE_URL=https://api.openai.com \
-LLM_API_KEY=sk-... \
-bouton
+LLM_MODEL=gpt-4o LLM_BASE_URL=https://api.openai.com LLM_API_KEY=sk-... bouton
 ```
 
-Talk to it. It reads, writes, and executes in the current directory.
+`LLM_PROVIDER` selects one when multiple are configured. With no env hint, bouton offers an interactive picker on first run and remembers your last choice.
 
+### Slash commands
+
+- `/new` — wipe session, restart
+- `/undo` — revert the last file edit (byte-exact)
+- `/cd <path>` — change cwd
+- `/pwd` — show cwd
+- `/session` — show session info
+
+### YAML agent personalities
+
+Place YAML configs under `${BOUTON_AGENTS_DIR:-~/.config/bouton/agents}/`:
+
+```yaml
+name: reviewer
+system_prompt: ./reviewer.md
+tools:
+  - name: submit_review
+    type: shell
+    description: "Submit a GitHub PR review."
+    schema:
+      type: object
+      properties:
+        verdict: { type: string, enum: [approve, request_changes] }
+        body:    { type: string }
+      required: [verdict, body]
+    command: gh pr review --{{.verdict}} --body {{.body | shellQuote}}
+    timeout_seconds: 10
 ```
-> add a /version flag to cmd/foo
-[tool search]
-[tool read]
-[tool write] cmd/foo/main.go
-[tool exec] go build ./...
-done.
-```
+
+Then `bouton --agent reviewer`.
 
 ## What's built in
 
-bouton inherits the runtime's tool set from axon: `read`, `write`, `exec`, `search`, `task`, `bash_output`, `kill_shell`. Every tool call requires a `reason` field. Edits are atomic. Ctrl-C cancels the in-flight turn — both the model stream and any running subprocess.
+bouton inherits axon's tool set: `read`, `write`, `exec`, `search`, `task`, `bash_output`, `kill_shell`. Every tool call requires a `reason` field. File writes are atomic, so `/undo` is byte-exact. Ctrl-C cancels the in-flight turn — both the model stream and any running subprocess.
 
-There is no sandbox. Use Ctrl-C and `git` as your guardrails.
-
-## Configuration
-
-bouton reads three environment variables:
-
-| Variable        | Purpose                                          |
-| --------------- | ------------------------------------------------ |
-| `LLM_MODEL`     | Model name (`gpt-4o`, `claude-3-opus`, …)        |
-| `LLM_BASE_URL`  | OpenAI-compatible API base URL                   |
-| `LLM_API_KEY`   | API key                                          |
-| `LLM_PROVIDER`  | Optional. Name hint for the provider.            |
-
-Bring your own provider — anything OpenAI-compatible works (OpenAI, Anthropic via proxy, Ollama, LM Studio, vLLM).
+There is no sandbox. Use Ctrl-C, `/undo`, and `git` as your guardrails.
 
 ## Why a separate repo
 
 axon is the runtime — a library that drives the agent loop and can host any agent personality. bouton is one such personality: opinionated for coding work in a terminal. Keeping them separate means:
 
-- axon stays minimal and importable for other agents (reviewer, researcher, …).
-- bouton can ship binaries, slash commands, and a coding-flavored system prompt without bloating the library.
+- axon stays minimal and importable for other agents (reviewer, researcher, orchestrators).
+- bouton can ship binaries, slash commands, paste-aware input, and coding-specific defaults without bloating the library.
 
 ## License
 
